@@ -3,7 +3,7 @@
   "publisher": "securepy",
   "displayName": "SecurePy",
   "description": "Run the SecurePy Python security scanner in VS Code with diagnostics, workspace scanning, and scan-on-save support. ",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "engines": {
     "vscode": "^1.110.0"
   },

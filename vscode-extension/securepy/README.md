@@ -4,18 +4,23 @@ A powerful, extensible static security analyzer for Python code. Detect security
 
 ## Requirements
 
-SecurePy must be installed in your Python environment.
+## Requirements
 
-Recommended:
+SecurePy must be installed in a Python interpreter available to VS Code.
 
-pip install securepy
+Recommended installation:
+
+```bash
+python3.12 -m pip install securepy
+```
 
 Optional:
 - Set `securepy.executablePath` to a specific SecurePy executable path.
 
 If `securepy.executablePath` is empty, the extension will try:
-- `python3 -m securepy`
-- `python -m securepy`
+- the configured VS Code Python interpreter
+- local virtual environments such as .venv
+- common commands like python3.12, python3, and python
 
 
 ## Features

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
-import { execFile } from "child_process";
+import * as path from "path";
+import { execFile, ExecFileException } from "child_process";
 
 type SecurePyIssue = {
   filename?: string;
@@ -258,61 +259,37 @@ async function runSecurePyScan(
     "--no-color"
   ]);
 
-  const directArgs = ["scan", ...targets, ...extraArgs];
-  const pythonModuleArgs = ["-m", "securepy", "scan", ...targets, ...extraArgs];
-
-  const commandsToTry: Array<{ command: string; args: string[]; label: string }> = [];
-
-  if (configuredExecutablePath.length > 0) {
-    commandsToTry.push({
-      command: configuredExecutablePath,
-      args: directArgs,
-      label: configuredExecutablePath
-    });
-  }
-
-  commandsToTry.push(
-    {
-      command: "python3",
-      args: pythonModuleArgs,
-      label: "python3 -m securepy"
-    },
-    {
-      command: "python",
-      args: pythonModuleArgs,
-      label: "python -m securepy"
-    }
-  );
+  const attempts = buildSecurePyAttempts(targets, extraArgs, configuredExecutablePath, cwd);
 
   outputChannel.clear();
-
   if (showOutput) {
     outputChannel.show(true);
   }
 
-  let lastError: Error | null = null;
-  let combinedStderr = "";
+  let combinedErrors = "";
 
-  for (const attempt of commandsToTry) {
-    outputChannel.appendLine(`Running: ${attempt.label} ${attempt.args.join(" ")}`);
+  for (const attempt of attempts) {
+    outputChannel.appendLine(`Running: ${attempt.command} ${attempt.args.join(" ")}`);
     outputChannel.appendLine("");
 
     const result = await execFileAsync(attempt.command, attempt.args, cwd);
 
-    if (result.stderr?.trim()) {
+    if (result.stderr.trim()) {
       outputChannel.appendLine("stderr:");
       outputChannel.appendLine(result.stderr);
       outputChannel.appendLine("");
-      combinedStderr += `${attempt.label} stderr:\n${result.stderr}\n`;
     }
 
     if (result.error) {
-      lastError = result.error;
+      combinedErrors += `[${attempt.command}] ${result.error.message}\n`;
+      if (result.stderr.trim()) {
+        combinedErrors += `${result.stderr}\n`;
+      }
 
       outputChannel.appendLine(`Attempt failed: ${result.error.message}`);
       outputChannel.appendLine("");
 
-      if (isCommandNotFoundError(result.error)) {
+      if (shouldTryNextAttempt(result.error, result.stderr)) {
         continue;
       }
 
@@ -323,10 +300,11 @@ async function runSecurePyScan(
     const stdout = result.stdout ?? "";
 
     if (!stdout.trim()) {
-      diagnosticCollection.clear();
+      combinedErrors += `[${attempt.command}] No output returned.\n`;
       outputChannel.appendLine("No JSON output received from SecurePy.");
-      vscode.window.showWarningMessage("SecurePy completed, but returned no JSON output.");
-      return;
+      outputChannel.appendLine("");
+
+      continue;
     }
 
     outputChannel.appendLine("stdout:");
@@ -335,49 +313,216 @@ async function runSecurePyScan(
 
     try {
       const parsed = JSON.parse(stdout) as SecurePyJson;
-      await applyDiagnostics(parsed);
+      applyDiagnostics(parsed);
+
       if (showOutput) {
         vscode.window.showInformationMessage("SecurePy scan complete.");
       }
       return;
     } catch (parseError) {
+      combinedErrors += `[${attempt.command}] JSON parse failed: ${String(parseError)}\n`;
       outputChannel.appendLine("Failed to parse SecurePy JSON output.");
       outputChannel.appendLine(String(parseError));
-      vscode.window.showWarningMessage("SecurePy completed, but JSON parsing failed.");
-      return;
+      outputChannel.appendLine("");
+
+      continue;
     }
   }
 
-  const installMessage =
-    "SecurePy could not be launched. Install it with 'pip install securepy' or set 'securepy.executablePath' in VS Code settings.";
-
-  if (combinedStderr.trim()) {
-    outputChannel.appendLine("All launch attempts failed.");
-    outputChannel.appendLine(combinedStderr);
+  outputChannel.appendLine("All SecurePy launch attempts failed.");
+  if (combinedErrors.trim()) {
+    outputChannel.appendLine(combinedErrors);
   }
 
-  vscode.window.showErrorMessage(installMessage);
+  vscode.window.showErrorMessage(
+    "SecurePy could not be launched. Install it into your active Python interpreter with 'python -m pip install securepy', or set 'securepy.executablePath' in VS Code settings."
+  );
+}
+
+type SecurePyAttempt = {
+  command: string;
+  args: string[];
+};
+
+function buildSecurePyAttempts(
+  targets: string[],
+  extraArgs: string[],
+  configuredExecutablePath: string,
+  cwd?: string
+): SecurePyAttempt[] {
+  const attempts: SecurePyAttempt[] = [];
+  const seen = new Set<string>();
+
+  const directArgs = ["scan", ...targets, ...extraArgs];
+  const moduleArgs = ["-m", "securepy", "scan", ...targets, ...extraArgs];
+
+  if (configuredExecutablePath) {
+    pushAttempt(attempts, seen, configuredExecutablePath, directArgs);
+  }
+
+  for (const interpreter of getPythonInterpreterCandidates(cwd)) {
+    pushAttempt(attempts, seen, interpreter, moduleArgs);
+  }
+
+  return attempts;
+}
+
+function pushAttempt(
+  attempts: SecurePyAttempt[],
+  seen: Set<string>,
+  command: string,
+  args: string[]
+): void {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const key = `${trimmed}::${args.join("\u0000")}`;
+  if (seen.has(key)) {
+    return;
+  }
+
+  seen.add(key);
+  attempts.push({ command: trimmed, args });
+}
+
+function getPythonInterpreterCandidates(cwd?: string): string[] {
+  const pythonConfig = vscode.workspace.getConfiguration("python");
+  const workspaceFolder = getWorkspaceFolderForCwd(cwd);
+
+  const configuredInterpreter = resolveInterpreterPath(
+    pythonConfig.get<string>("defaultInterpreterPath", ""),
+    workspaceFolder
+  );
+
+  const legacyInterpreter = resolveInterpreterPath(
+    pythonConfig.get<string>("pythonPath", ""),
+    workspaceFolder
+  );
+
+  const localVenvs = getLocalVenvCandidates(workspaceFolder);
+  const activeVenv = getActiveVenvPython();
+
+  return [
+    configuredInterpreter,
+    legacyInterpreter,
+    ...localVenvs,
+    activeVenv,
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "python3",
+    "python"
+  ].filter((value, index, array) => value && array.indexOf(value) === index);
+}
+
+function getWorkspaceFolderForCwd(cwd?: string): string | undefined {
+  if (cwd) {
+    return cwd;
+  }
+
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  return folder?.uri.fsPath;
+}
+
+function resolveInterpreterPath(rawPath: string, workspaceFolder?: string): string {
+  const value = (rawPath ?? "").trim();
+  if (!value) {
+    return "";
+  }
+
+  if (workspaceFolder) {
+    return value.replace(/\$\{workspaceFolder\}/g, workspaceFolder);
+  }
+
+  return value;
+}
+
+function getLocalVenvCandidates(workspaceFolder?: string): string[] {
+  if (!workspaceFolder) {
+    return [];
+  }
+
+  const candidates: string[] = [];
+
+  if (process.platform === "win32") {
+    candidates.push(
+      path.join(workspaceFolder, ".venv", "Scripts", "python.exe"),
+      path.join(workspaceFolder, "venv", "Scripts", "python.exe")
+    );
+  } else {
+    candidates.push(
+      path.join(workspaceFolder, ".venv", "bin", "python"),
+      path.join(workspaceFolder, "venv", "bin", "python")
+    );
+  }
+
+  return candidates;
 }
 
 function execFileAsync(
   command: string,
   args: string[],
   cwd?: string
-): Promise<{ stdout: string; stderr: string; error: Error | null }> {
+): Promise<{ stdout: string; stderr: string; error: ExecFileException | null }> {
   return new Promise((resolve) => {
-    execFile(command, args, { cwd }, (error, stdout, stderr) => {
-      resolve({
-        stdout: stdout ?? "",
-        stderr: stderr ?? "",
-        error: error ?? null
-      });
-    });
+    execFile(
+      command,
+      args,
+      {
+        cwd,
+        encoding: "utf8"
+      },
+      (
+        error: ExecFileException | null,
+        stdout: string,
+        stderr: string
+      ) => {
+        resolve({
+          stdout: stdout ?? "",
+          stderr: stderr ?? "",
+          error
+        });
+      }
+    );
   });
 }
 
-function isCommandNotFoundError(error: Error): boolean {
-  const maybeNodeError = error as NodeJS.ErrnoException;
-  return maybeNodeError.code === "ENOENT";
+function getActiveVenvPython(): string {
+  const venv = process.env.VIRTUAL_ENV?.trim();
+  if (!venv) {
+    return "";
+  }
+
+  if (process.platform === "win32") {
+    return path.join(venv, "Scripts", "python.exe");
+  }
+
+  return path.join(venv, "bin", "python");
+}
+
+function shouldTryNextAttempt(error: ExecFileException, stderr: string): boolean {
+  const code = error.code;
+  const combined = `${error.message}\n${stderr}`.toLowerCase();
+
+  if (code === "ENOENT") {
+    return true;
+  }
+
+  if (combined.includes("no module named securepy")) {
+    return true;
+  }
+
+  if (combined.includes("dataclass() got an unexpected keyword argument 'slots'")) {
+    return true;
+  }
+
+  if (combined.includes("module named securepy")) {
+    return true;
+  }
+
+  return false;
 }
 
 async function applyDiagnostics(data: SecurePyJson): Promise<void> {
